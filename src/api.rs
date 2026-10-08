@@ -760,6 +760,12 @@ struct CiphersPostReq {
     identity: Option<CipherIdentity>,
     #[serde(rename = "secureNote")]
     secure_note: Option<CipherSecureNote>,
+    // Vaultwarden >= 1.37.4 rejects cipher writes without the user id.
+    #[serde(
+        rename = "encryptedFor",
+        skip_serializing_if = "Option::is_none"
+    )]
+    encrypted_for: Option<String>,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -780,6 +786,26 @@ struct CiphersPutReq {
     secure_note: Option<CipherSecureNote>,
     #[serde(rename = "passwordHistory")]
     password_history: Vec<CiphersPutReqHistory>,
+    // Vaultwarden >= 1.37.4 rejects cipher writes without the user id.
+    #[serde(
+        rename = "encryptedFor",
+        skip_serializing_if = "Option::is_none"
+    )]
+    encrypted_for: Option<String>,
+}
+
+// The user id the server expects in `encryptedFor` is the `sub` claim of the
+// access token. Decoded only, not verified: the server does that.
+fn user_id_from_access_token(access_token: &str) -> Option<String> {
+    let payload = access_token.split('.').nth(1)?;
+    let payload =
+        crate::base64::decode_url_safe_no_pad(payload.trim_end_matches('='))
+            .ok()?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload).ok()?;
+    claims
+        .get("sub")?
+        .as_str()
+        .map(std::string::ToString::to_string)
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -1211,6 +1237,7 @@ impl Client {
             card: None,
             identity: None,
             secure_note: None,
+            encrypted_for: user_id_from_access_token(access_token),
         };
         match data {
             crate::db::EntryData::Login {
@@ -1361,6 +1388,7 @@ impl Client {
                     password: entry.password.clone(),
                 })
                 .collect(),
+            encrypted_for: user_id_from_access_token(access_token),
         };
         match data {
             crate::db::EntryData::Login {
@@ -1765,4 +1793,47 @@ fn classify_login_error(error_res: &ConnectErrorRes, code: u16) -> Error {
 
     log::warn!("unexpected error received during login: {error_res:?}");
     Error::RequestFailed { status: code }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_id_from_access_token_reads_sub_claim() {
+        let payload = crate::base64::encode_url_safe_no_pad(
+            br#"{"sub":"0b2c4d6e-user-id","email":"e@example.com"}"#,
+        );
+        let token = format!("eyJhbGciOiJSUzI1NiJ9.{payload}.signature");
+        assert_eq!(
+            user_id_from_access_token(&token).as_deref(),
+            Some("0b2c4d6e-user-id")
+        );
+        assert_eq!(user_id_from_access_token("not-a-jwt"), None);
+        assert_eq!(user_id_from_access_token("a.!!!.c"), None);
+    }
+
+    #[test]
+    fn cipher_post_req_sends_encrypted_for() {
+        let req = CiphersPostReq {
+            ty: 2,
+            folder_id: None,
+            name: "name".to_string(),
+            notes: None,
+            login: None,
+            card: None,
+            identity: None,
+            secure_note: Some(CipherSecureNote {}),
+            encrypted_for: Some("0b2c4d6e-user-id".to_string()),
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert_eq!(json["encryptedFor"], "0b2c4d6e-user-id");
+
+        let req = CiphersPostReq {
+            encrypted_for: None,
+            ..req
+        };
+        let json = serde_json::to_value(&req).unwrap();
+        assert!(json.get("encryptedFor").is_none());
+    }
 }
